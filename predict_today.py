@@ -21,6 +21,7 @@ It prints the win / draw / win probabilities, the pick, and a tag
 
 import os
 import sys
+import time
 import warnings
 import numpy as np
 import pandas as pd
@@ -35,7 +36,13 @@ warnings.filterwarnings("ignore")
 
 CACHE_DIR = "data_cache"
 RESULTS_URL = "https://raw.githubusercontent.com/martj42/international_results/master/results.csv"
+GOALSCORERS_URL = "https://raw.githubusercontent.com/martj42/international_results/master/goalscorers.csv"
 FIXTURES_PATH = os.path.join(CACHE_DIR, "fixtures.csv")
+RESULTS_MAX_AGE_HOURS = 24  # auto-refresh cached results.csv when older than this
+
+# top-scorer model
+SCORER_HALFLIFE_DAYS = 540   # ~18 months: weight that a recent goal carries vs. older ones
+SCORER_LOOKBACK_DAYS = 365 * 4  # ignore goals older than ~4 years entirely
 
 # normalizes the historical results.csv team names
 NAME_MAP = {
@@ -83,14 +90,24 @@ plt.rcParams.update({
 
 
 # ── data loading ────────────────────────────────────────────────────────────────
-def fetch_results():
+def fetch_results(force_refresh=False):
     os.makedirs(CACHE_DIR, exist_ok=True)
     path = os.path.join(CACHE_DIR, "results.csv")
-    if not os.path.exists(path):
-        resp = requests.get(RESULTS_URL, timeout=120)
-        resp.raise_for_status()
-        with open(path, "wb") as fh:
-            fh.write(resp.content)
+    stale = False
+    if os.path.exists(path):
+        age_h = (time.time() - os.path.getmtime(path)) / 3600.0
+        stale = age_h >= RESULTS_MAX_AGE_HOURS
+    if not os.path.exists(path) or force_refresh or stale:
+        try:
+            print("  Refreshing results.csv from upstream ...")
+            resp = requests.get(RESULTS_URL, timeout=120)
+            resp.raise_for_status()
+            with open(path, "wb") as fh:
+                fh.write(resp.content)
+        except Exception as e:
+            if not os.path.exists(path):
+                raise
+            print(f"  (warning: couldn't refresh results.csv: {e}; using cached copy)")
     return pd.read_csv(path)
 
 
@@ -98,8 +115,8 @@ def normalize_country(name):
     return NAME_MAP.get(name, name) if isinstance(name, str) else name
 
 
-def load_results():
-    r = fetch_results()
+def load_results(force_refresh=False):
+    r = fetch_results(force_refresh=force_refresh)
     r["home_team"] = r["home_team"].map(normalize_country)
     r["away_team"] = r["away_team"].map(normalize_country)
     r["date"] = pd.to_datetime(r["date"])
@@ -108,6 +125,83 @@ def load_results():
     r["away_score"] = r["away_score"].astype(int)
     r["neutral"] = r["neutral"].astype(str).str.upper().eq("TRUE").astype(int)
     return r.sort_values("date").reset_index(drop=True)
+
+
+def fetch_goalscorers(force_refresh=False):
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    path = os.path.join(CACHE_DIR, "goalscorers.csv")
+    stale = False
+    if os.path.exists(path):
+        age_h = (time.time() - os.path.getmtime(path)) / 3600.0
+        stale = age_h >= RESULTS_MAX_AGE_HOURS
+    if not os.path.exists(path) or force_refresh or stale:
+        try:
+            print("  Refreshing goalscorers.csv from upstream ...")
+            resp = requests.get(GOALSCORERS_URL, timeout=120)
+            resp.raise_for_status()
+            with open(path, "wb") as fh:
+                fh.write(resp.content)
+        except Exception as e:
+            if not os.path.exists(path):
+                raise
+            print(f"  (warning: couldn't refresh goalscorers.csv: {e}; using cached copy)")
+    return pd.read_csv(path)
+
+
+def load_goalscorers(force_refresh=False):
+    g = fetch_goalscorers(force_refresh=force_refresh)
+    g["team"] = g["team"].map(normalize_country)
+    g["home_team"] = g["home_team"].map(normalize_country)
+    g["away_team"] = g["away_team"].map(normalize_country)
+    g["date"] = pd.to_datetime(g["date"], errors="coerce")
+    g = g.dropna(subset=["date", "scorer", "team"]).copy()
+    g["own_goal"] = g["own_goal"].astype(str).str.upper().eq("TRUE")
+    # own goals don't count toward the scorer's tally for their own team
+    g = g[~g["own_goal"]].copy()
+    return g.sort_values("date").reset_index(drop=True)
+
+
+def predict_top_scorer(goals, results, team, asof,
+                       halflife_days=SCORER_HALFLIFE_DAYS,
+                       lookback_days=SCORER_LOOKBACK_DAYS):
+    """Most likely goal-scorer for ``team`` in a match on ``asof``.
+
+    Uses recency-weighted goals for the national team to pick a single player,
+    then estimates that player's expected goals in this match as
+        player_share_of_team_goals × team_goals_per_match_recent_avg
+    and converts to "scores at least one" via 1 - exp(-xG) (Poisson assumption).
+
+    Returns (player_name, expected_goals, prob_scores_at_least_one).
+    Returns (None, 0.0, 0.0) if there's no recent scoring history for the team.
+    """
+    asof = pd.Timestamp(asof)
+    earliest = asof - pd.Timedelta(days=lookback_days)
+    sub = goals[(goals["team"] == team)
+                & (goals["date"] < asof)
+                & (goals["date"] >= earliest)]
+    if len(sub) == 0:
+        return None, 0.0, 0.0
+
+    age_days = (asof - sub["date"]).dt.days.clip(lower=0)
+    weights = np.power(0.5, age_days / halflife_days)
+    sub = sub.assign(_w=weights.values)
+    by_player = sub.groupby("scorer")["_w"].sum().sort_values(ascending=False)
+    top_player = str(by_player.index[0])
+    team_weighted_goals = float(by_player.sum())
+    player_share = float(by_player.iloc[0] / team_weighted_goals) if team_weighted_goals > 0 else 0.0
+
+    rmatches = results[((results["home_team"] == team) | (results["away_team"] == team))
+                       & (results["date"] < asof)
+                       & (results["date"] >= earliest)]
+    if len(rmatches) == 0:
+        return top_player, 0.0, 0.0
+    gf = np.where(rmatches["home_team"] == team,
+                  rmatches["home_score"], rmatches["away_score"]).astype(float)
+    team_goals_per_match = float(gf.mean())
+
+    player_xg = max(player_share * team_goals_per_match, 0.0)
+    prob = 1.0 - float(np.exp(-player_xg))
+    return top_player, round(player_xg, 3), round(prob, 4)
 
 
 # ── feature engineering ─────────────────────────────────────────────────────────
@@ -353,22 +447,146 @@ def tag_match(top_prob, p_home, p_away, home_elo, away_elo):
     return strength + ("  ⚠️ UPSET PICK" if upset else "")
 
 
+# ── scoring previous predictions ───────────────────────────────────────────────
+SCORE_COLS = ("actual_home_score", "actual_away_score", "actual_outcome",
+              "correct", "match_logloss")
+
+
+def score_previous_predictions(results, pred_dir="predictions"):
+    """Score any previously-saved predictions whose match has now been played.
+
+    Scans every predictions/<run>/predictions.csv, looks up each unscored row
+    in the refreshed results dataset, and writes the actual result + a
+    correctness flag + per-match log-loss back into the file. Prints a summary
+    of what was newly scored since the last run plus lifetime totals.
+    """
+    if not os.path.isdir(pred_dir):
+        return
+
+    r = results[["date", "home_team", "away_team", "home_score", "away_score"]].copy()
+    r["date_str"] = r["date"].dt.strftime("%Y-%m-%d")
+    lookup = {}
+    for _, row in r.iterrows():
+        lookup[(row.date_str, row.home_team, row.away_team)] = (
+            int(row.home_score), int(row.away_score))
+
+    def canon(name):
+        return normalize_country(map_fixture_name(str(name)))
+
+    newly = []
+    lifetime = []
+
+    for run in sorted(os.listdir(pred_dir)):
+        csv_path = os.path.join(pred_dir, run, "predictions.csv")
+        if not os.path.isfile(csv_path):
+            continue
+        df = pd.read_csv(csv_path)
+        for col in SCORE_COLS:
+            if col not in df.columns:
+                df[col] = pd.NA
+
+        changed = False
+        for i, row in df.iterrows():
+            already = pd.notna(row.get("actual_outcome"))
+            if not already:
+                date_s = str(row["date"])
+                home_c, away_c = canon(row["home"]), canon(row["away"])
+                actual = lookup.get((date_s, home_c, away_c))
+                swapped = False
+                if actual is None:
+                    actual = lookup.get((date_s, away_c, home_c))
+                    swapped = True
+                if actual is None:
+                    continue  # not played yet
+                hs, as_ = actual
+                if swapped:
+                    hs, as_ = as_, hs
+                if hs > as_:
+                    outcome = "home"
+                elif hs == as_:
+                    outcome = "draw"
+                else:
+                    outcome = "away"
+                pick = str(row["pick"])
+                if outcome == "home":
+                    correct = pick == str(row["home"])
+                    p_actual = float(row["p_home"])
+                elif outcome == "draw":
+                    correct = pick == "Draw"
+                    p_actual = float(row["p_draw"])
+                else:
+                    correct = pick == str(row["away"])
+                    p_actual = float(row["p_away"])
+                ll = -float(np.log(max(p_actual, 1e-9)))
+                df.at[i, "actual_home_score"] = hs
+                df.at[i, "actual_away_score"] = as_
+                df.at[i, "actual_outcome"] = outcome
+                df.at[i, "correct"] = bool(correct)
+                df.at[i, "match_logloss"] = round(ll, 4)
+                changed = True
+                newly.append({
+                    "date": date_s, "home": row["home"], "away": row["away"],
+                    "pick": pick, "confidence": float(row["confidence"]),
+                    "actual": outcome, "score": f"{hs}-{as_}",
+                    "correct": bool(correct), "logloss": ll,
+                })
+            outcome = df.at[i, "actual_outcome"]
+            if pd.notna(outcome):
+                lifetime.append({
+                    "correct": bool(df.at[i, "correct"]),
+                    "logloss": float(df.at[i, "match_logloss"]),
+                })
+        if changed:
+            df.to_csv(csv_path, index=False)
+
+    if not lifetime and not newly:
+        return
+
+    print("\n" + "=" * 60)
+    print("  Prediction scoreboard (vs latest results)")
+    print("=" * 60)
+    if newly:
+        n = len(newly)
+        n_correct = sum(1 for s in newly if s["correct"])
+        ll_avg = sum(s["logloss"] for s in newly) / n
+        print(f"  Newly scored since last run: {n}")
+        print(f"    Accuracy : {n_correct}/{n} = {n_correct/n*100:.1f}%")
+        print(f"    Log-loss : {ll_avg:.3f}")
+        for s in newly:
+            mark = "OK " if s["correct"] else "MISS"
+            actual_disp = {"home": s["home"], "away": s["away"], "draw": "Draw"}[s["actual"]]
+            print(f"    [{mark}] {s['date']}  {s['home']} vs {s['away']}  "
+                  f"pick={s['pick']} ({s['confidence']*100:.1f}%)  "
+                  f"actual={actual_disp} {s['score']}")
+    else:
+        print("  No new matches to score since last run.")
+    if lifetime:
+        ln = len(lifetime)
+        lc = sum(1 for s in lifetime if s["correct"])
+        lll = sum(s["logloss"] for s in lifetime) / ln
+        print(f"\n  Lifetime: {lc}/{ln} correct ({lc/ln*100:.1f}%)  log-loss {lll:.3f}")
+    print("=" * 60)
+
+
 # ── main ────────────────────────────────────────────────────────────────────────
-def get_teams_from_args():
-    """Two team names from the command line, or ask for them interactively."""
-    if len(sys.argv) >= 3:
-        return sys.argv[1], sys.argv[2]
-    print("Enter the two teams to predict (e.g. Saudi Arabia / Uruguay).")
-    a = input("  Team 1: ").strip()
-    b = input("  Team 2: ").strip()
-    return a, b
+def parse_args(argv):
+    """Pull flags out of argv. Returns (positional_args, options_dict)."""
+    args, opts = [], {"refresh": False, "all": False}
+    for a in argv[1:]:
+        if a == "--refresh":
+            opts["refresh"] = True
+        elif a in ("--all", "-a"):
+            opts["all"] = True
+        else:
+            args.append(a)
+    return args, opts
 
 
-def main():
-    team_a, team_b = get_teams_from_args()
-
+def predict_single(team_a, team_b, refresh=False):
     print("\nLoading data + building features ...")
-    results = load_results()
+    results = load_results(force_refresh=refresh)
+    goals = load_goalscorers(force_refresh=refresh)
+    score_previous_predictions(results)
     dataset, final_elo = build_dataset(results)
     valid_teams = set(results["home_team"]) | set(results["away_team"])
     long = per_team_long(results)
@@ -384,7 +602,7 @@ def main():
         return
 
     match_date = m["date"]
-    print(f"Training model (data up to {match_date} ...")
+    print(f"Training model (data up to {match_date}) ...")
     train, val = split_by_date(dataset, TRAIN_START, VAL_START, match_date)
     model, X_val, y_val = train_model(train, val)
 
@@ -399,7 +617,9 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
     chart = make_chart(m, p_home, p_draw, p_away, match_date, out_dir)
 
-    # print the single result
+    h_scorer, h_xg, h_prob = predict_top_scorer(goals, results, m["home"], match_date)
+    a_scorer, a_xg, a_prob = predict_top_scorer(goals, results, m["away"], match_date)
+
     print("\n" + "=" * 60)
     print(f"  {m['home_disp']} vs {m['away_disp']}")
     print(f"  {match_date}  ·  {m['group']}  ·  {m['stadium']}")
@@ -409,8 +629,143 @@ def main():
     print(f"  {m['away_disp']:<22} win   {p_away*100:>5.1f}%")
     print("-" * 60)
     print(f"  PICK: {pick}  ({conf*100:.1f}%)   [{tag}]")
+    print("-" * 60)
+    if h_scorer:
+        print(f"  Top scorer pick · {m['home_disp']:<18} {h_scorer}  "
+              f"(xG {h_xg:.2f}, scores {h_prob*100:.1f}%)")
+    if a_scorer:
+        print(f"  Top scorer pick · {m['away_disp']:<18} {a_scorer}  "
+              f"(xG {a_xg:.2f}, scores {a_prob*100:.1f}%)")
     print("=" * 60)
     print(f"  Chart saved -> {chart}\n")
+
+
+def predict_all(refresh=False):
+    """Predict every upcoming fixture in fixtures.csv using the latest results data.
+
+    Training is done once (cutoff = today), then reused for every fixture. Each
+    run writes a per-fixture chart and a single summary predictions.csv under
+    predictions/<today>/.
+    """
+    print("\nLoading data + building features ...")
+    results = load_results(force_refresh=refresh)
+    goals = load_goalscorers(force_refresh=refresh)
+    score_previous_predictions(results)
+    dataset, final_elo = build_dataset(results)
+    valid_teams = set(results["home_team"]) | set(results["away_team"])
+    long = per_team_long(results)
+
+    today = pd.Timestamp.today().normalize()
+    cutoff = today + pd.Timedelta(days=1)
+    print(f"Training model (data up to {today.date()}) ...")
+    train, val = split_by_date(dataset, TRAIN_START, VAL_START, cutoff)
+    model, X_val, y_val = train_model(train, val)
+    evaluate(model, X_val, y_val)
+
+    fx = pd.read_csv(FIXTURES_PATH)
+    fx["_dt"] = pd.to_datetime(fx["date_dt"], errors="coerce")
+
+    run_label = str(today.date())
+    run_dir = os.path.join("predictions", run_label)
+    os.makedirs(run_dir, exist_ok=True)
+
+    rows, skipped_placeholder, skipped_played = [], 0, 0
+    for _, fr in fx.sort_values("_dt").iterrows():
+        teams = str(fr.get("teams", ""))
+        if " v " not in teams:
+            continue
+        left, right = [p.strip() for p in teams.split(" v ")]
+        home = map_fixture_name(left)
+        away = map_fixture_name(right)
+        if home not in valid_teams or away not in valid_teams:
+            skipped_placeholder += 1
+            continue
+        if pd.notna(fr["_dt"]) and fr["_dt"] < today:
+            skipped_played += 1
+            continue
+
+        match_date = fr.get("date_dt", "")
+        m = {"match": fr.get("match_number", ""),
+             "group": fr.get("group", ""),
+             "stadium": fr.get("stadium", ""),
+             "date": match_date,
+             "home_disp": left, "away_disp": right,
+             "home": home, "away": away}
+
+        p_home, p_draw, p_away = predict_symmetric(
+            model, long, final_elo, home, away, match_date, MATCH_NEUTRAL, MATCH_WEIGHT)
+        outcomes = [(left, p_home), ("Draw", p_draw), (right, p_away)]
+        pick, conf = max(outcomes, key=lambda x: x[1])
+        he, ae = final_elo.get(home, ELO_BASE), final_elo.get(away, ELO_BASE)
+        tag = tag_match(conf, p_home, p_away, he, ae)
+        chart = make_chart(m, p_home, p_draw, p_away, match_date, run_dir)
+
+        h_scorer, h_xg, h_prob = predict_top_scorer(goals, results, home, match_date)
+        a_scorer, a_xg, a_prob = predict_top_scorer(goals, results, away, match_date)
+
+        rows.append({
+            "match": m["match"], "date": match_date, "group": m["group"],
+            "stadium": m["stadium"], "home": left, "away": right,
+            "p_home": round(p_home, 4), "p_draw": round(p_draw, 4),
+            "p_away": round(p_away, 4),
+            "pick": pick, "confidence": round(conf, 4),
+            "tag": tag,
+            "home_top_scorer": h_scorer or "",
+            "home_scorer_xg": h_xg,
+            "home_scorer_prob": h_prob,
+            "away_top_scorer": a_scorer or "",
+            "away_scorer_xg": a_xg,
+            "away_scorer_prob": a_prob,
+            "chart": os.path.relpath(chart),
+        })
+
+    df = pd.DataFrame(rows)
+    csv_path = os.path.join(run_dir, "predictions.csv")
+    df.to_csv(csv_path, index=False)
+
+    print(f"\nPredicted {len(df)} upcoming matches  "
+          f"(skipped {skipped_played} already played, {skipped_placeholder} placeholder fixtures).")
+    if not df.empty:
+        print("\n  " + f"{'Date':<11} {'Match':<42} {'Home':>6} {'Draw':>6} {'Away':>6}  Pick")
+        print("  " + "-" * 92)
+        for _, r in df.iterrows():
+            mp = f"{r['home']} vs {r['away']}"
+            if len(mp) > 41:
+                mp = mp[:38] + "..."
+            print(f"  {str(r['date']):<11} {mp:<42} "
+                  f"{r['p_home']*100:>5.1f}% {r['p_draw']*100:>5.1f}% {r['p_away']*100:>5.1f}%  "
+                  f"{r['pick']} [{r['tag']}]")
+
+        print("\n  Top scorer picks (1 per team)")
+        print("  " + "-" * 92)
+        for _, r in df.iterrows():
+            mp = f"{r['home']} vs {r['away']}"
+            if len(mp) > 35:
+                mp = mp[:32] + "..."
+            h_disp = f"{r['home_top_scorer']} ({r['home_scorer_prob']*100:.0f}%)" if r['home_top_scorer'] else "-"
+            a_disp = f"{r['away_top_scorer']} ({r['away_scorer_prob']*100:.0f}%)" if r['away_top_scorer'] else "-"
+            print(f"  {str(r['date']):<11} {mp:<36}  {r['home']:<14}→ {h_disp:<32}  {r['away']:<14}→ {a_disp}")
+    print(f"\nSummary CSV -> {csv_path}")
+    print(f"Charts      -> {run_dir}\n")
+
+
+def main():
+    args, opts = parse_args(sys.argv)
+
+    # Two team names → single-match mode (preserves the original behavior).
+    if len(args) >= 2:
+        predict_single(args[0], args[1], refresh=opts["refresh"])
+        return
+
+    # No team args, or --all → predict every upcoming fixture.
+    if len(args) == 0 or opts["all"]:
+        predict_all(refresh=opts["refresh"])
+        return
+
+    # Only one team name supplied — fall back to interactive prompt.
+    print("Enter the two teams to predict (e.g. Saudi Arabia / Uruguay).")
+    b = input("  Team 2: ").strip()
+    predict_single(args[0], b, refresh=opts["refresh"])
 
 
 if __name__ == "__main__":
