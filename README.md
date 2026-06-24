@@ -66,4 +66,4 @@ Historical results come from the open [martj42/international_results](https://gi
 
 ## License
 
-MIT — do whatever you want with it. If you build something cool on top, I'd love to see it and make sure you tag me @mar_antaya on Tiktok, Youtube and Instagram or Mariana Antaya on Linkedin!
+Thanks Mariana Antaya for the base for this!
