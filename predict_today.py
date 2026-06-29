@@ -34,6 +34,14 @@ from sklearn.metrics import accuracy_score, log_loss, classification_report
 
 warnings.filterwarnings("ignore")
 
+# Make sure unicode (arrows, accents, emoji in player/country names) prints on
+# Windows consoles and through stdout redirection regardless of codepage.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 CACHE_DIR = "data_cache"
 RESULTS_URL = "https://raw.githubusercontent.com/martj42/international_results/master/results.csv"
 GOALSCORERS_URL = "https://raw.githubusercontent.com/martj42/international_results/master/goalscorers.csv"
@@ -447,12 +455,262 @@ def tag_match(top_prob, p_home, p_away, home_elo, away_elo):
     return strength + ("  ⚠️ UPSET PICK" if upset else "")
 
 
+# ── group-stage stakes (clinched / must-win / eliminated) ──────────────────────
+STAKE_CLINCHED = "clinched"
+STAKE_ELIMINATED = "eliminated"
+STAKE_MUST_WIN = "must_win"
+STAKE_LIVE = "live"
+
+# How much to bend probabilities for stakes. Kept small because the signal is
+# noisy and we don't have a labeled history big enough to learn it.
+STAKE_MOTIVATION_BIAS = 0.05      # shift toward more-motivated side per motivation step
+STAKE_FRIENDLY_DRAW_BUMP = 0.08   # extra draw mass when both teams have nothing to play for
+STAKE_SCORER_XG_FACTOR = 0.70     # multiply predicted xG by this when team is clinched
+_STAKE_MOTIVATION = {STAKE_MUST_WIN: 2, STAKE_LIVE: 1,
+                     STAKE_CLINCHED: 0, STAKE_ELIMINATED: 0}
+
+
+def _standings_from_played(played):
+    """played: list of (home, away, hs, as_) for played group games.
+
+    Returns {team: {"pts": int, "gf": int, "ga": int, "gd": int, "played": int}}.
+    """
+    tbl = {}
+    def slot(t):
+        if t not in tbl:
+            tbl[t] = {"pts": 0, "gf": 0, "ga": 0, "gd": 0, "played": 0}
+        return tbl[t]
+    for h, a, hs, as_ in played:
+        sh, sa = slot(h), slot(a)
+        sh["gf"] += hs; sh["ga"] += as_
+        sa["gf"] += as_; sa["ga"] += hs
+        sh["played"] += 1; sa["played"] += 1
+        if hs > as_:
+            sh["pts"] += 3
+        elif hs < as_:
+            sa["pts"] += 3
+        else:
+            sh["pts"] += 1; sa["pts"] += 1
+    for s in tbl.values():
+        s["gd"] = s["gf"] - s["ga"]
+    return tbl
+
+
+def _scenario_outcomes(n):
+    """Enumerate all 3^n outcome tuples for n remaining games. Each element is
+    a tuple of 'H'/'D'/'A' of length n.
+    """
+    if n == 0:
+        return [()]
+    out = [()]
+    for _ in range(n):
+        out = [c + (s,) for c in out for s in ("H", "D", "A")]
+    return out
+
+
+def _apply_scenario(base, remaining, outcomes):
+    """Return a new standings dict after applying the given outcomes (tuple of
+    H/D/A) to the remaining fixtures (list of (home, away)).
+    """
+    tbl = {t: dict(s) for t, s in base.items()}
+    def slot(t):
+        if t not in tbl:
+            tbl[t] = {"pts": 0, "gf": 0, "ga": 0, "gd": 0, "played": 0}
+        return tbl[t]
+    # Use a representative scoreline: 1-0 for W/L, 1-1 for D. Goal margins are
+    # tiebreakers only; we don't try to enumerate every possible scoreline.
+    for (h, a), r in zip(remaining, outcomes):
+        sh, sa = slot(h), slot(a)
+        if r == "H":
+            sh["pts"] += 3; sh["gf"] += 1; sa["ga"] += 1
+        elif r == "A":
+            sa["pts"] += 3; sa["gf"] += 1; sh["ga"] += 1
+        else:
+            sh["pts"] += 1; sa["pts"] += 1
+            sh["gf"] += 1; sh["ga"] += 1; sa["gf"] += 1; sa["ga"] += 1
+    for s in tbl.values():
+        s["gd"] = s["gf"] - s["ga"]
+    return tbl
+
+
+def _top2_teams(standings):
+    """Return the set of top-2 teams by (pts, gd, gf). Ties beyond that fall
+    back to alphabetical for determinism — not a true tiebreaker but fine for
+    the all-or-nothing 'in top-2?' check we use below."""
+    order = sorted(standings.items(),
+                   key=lambda kv: (-kv[1]["pts"], -kv[1]["gd"], -kv[1]["gf"], kv[0]))
+    return {t for t, _ in order[:2]}
+
+
+def compute_group_stakes(results, fixtures_df, asof, manual_low_stakes=None):
+    """Classify each team in each group as must_win / live / clinched / eliminated.
+
+    Looks at every "Group X" fixture in fixtures_df, matches played ones against
+    results to build the live table, then enumerates every 3^k outcome for the
+    k remaining group games to determine whether each team's top-2 finish is
+    forced, blocked, or contingent on their own next result. ``asof`` is a
+    Timestamp; only fixtures whose date is strictly before it are considered
+    played.
+
+    Returns {team_canonical: stake_string}. Teams not in any group (knockouts,
+    placeholders) are simply absent — callers should default to ``live``.
+    """
+    asof_ts = pd.Timestamp(asof) if not isinstance(asof, pd.Timestamp) else asof
+
+    # Index results by (date_str, home_canonical, away_canonical) for fast lookup.
+    rl = results[["date", "home_team", "away_team", "home_score", "away_score"]].copy()
+    rl["date_str"] = rl["date"].dt.strftime("%Y-%m-%d")
+    rmap = {}
+    for _, r in rl.iterrows():
+        rmap[(r.date_str, r.home_team, r.away_team)] = (int(r.home_score), int(r.away_score))
+
+    fx = fixtures_df.copy()
+    fx["_dt"] = pd.to_datetime(fx.get("date_dt"), errors="coerce")
+    out = {}
+
+    for group, grp_rows in fx.groupby("group"):
+        if not isinstance(group, str) or not group.startswith("Group "):
+            continue
+        played, remaining = [], []
+        teams_in_group = set()
+        for _, fr in grp_rows.iterrows():
+            t = str(fr.get("teams", ""))
+            if " v " not in t:
+                continue
+            left, right = [p.strip() for p in t.split(" v ")]
+            h = normalize_country(map_fixture_name(left))
+            a = normalize_country(map_fixture_name(right))
+            teams_in_group.add(h); teams_in_group.add(a)
+            dt = fr["_dt"]
+            date_s = dt.strftime("%Y-%m-%d") if pd.notna(dt) else None
+            score = rmap.get((date_s, h, a)) if date_s else None
+            swapped = False
+            if score is None and date_s is not None:
+                score = rmap.get((date_s, a, h))
+                swapped = True
+            if score is not None and pd.notna(dt) and dt < asof_ts:
+                hs, as_ = score
+                if swapped:
+                    hs, as_ = as_, hs
+                played.append((h, a, hs, as_))
+            else:
+                remaining.append((h, a))
+
+        if not remaining:
+            continue  # group is done — no live stakes
+
+        base = _standings_from_played(played)
+        for t in teams_in_group:
+            base.setdefault(t, {"pts": 0, "gf": 0, "ga": 0, "gd": 0, "played": 0})
+
+        scenarios = _scenario_outcomes(len(remaining))
+        if len(scenarios) > 81:
+            # Should never happen for a 4-team group (max 6 games -> 3^6=729)
+            # but guard anyway.
+            scenarios = scenarios[:81]
+
+        # For each team, count whether they finish top-2 in each scenario,
+        # and separately when they personally win / draw / lose the matchday-3 game.
+        for team in teams_in_group:
+            # Find which (if any) remaining game involves this team and what
+            # outcome string corresponds to a win for them.
+            own_remaining_idx = None
+            own_win_outcome = None
+            for idx, (h, a) in enumerate(remaining):
+                if h == team:
+                    own_remaining_idx = idx; own_win_outcome = "H"; break
+                if a == team:
+                    own_remaining_idx = idx; own_win_outcome = "A"; break
+
+            total = top2_count = win_total = win_top2 = nonwin_total = nonwin_top2 = 0
+            for sc in scenarios:
+                final = _apply_scenario(base, remaining, sc)
+                t2 = _top2_teams(final)
+                in_t2 = team in t2
+                total += 1
+                top2_count += in_t2
+                if own_remaining_idx is not None:
+                    if sc[own_remaining_idx] == own_win_outcome:
+                        win_total += 1; win_top2 += in_t2
+                    else:
+                        nonwin_total += 1; nonwin_top2 += in_t2
+
+            if top2_count == total:
+                out[team] = STAKE_CLINCHED
+            elif top2_count == 0:
+                out[team] = STAKE_ELIMINATED
+            elif (own_remaining_idx is not None
+                  and nonwin_total > 0 and nonwin_top2 == 0
+                  and win_total > 0 and win_top2 > 0):
+                out[team] = STAKE_MUST_WIN
+            else:
+                out[team] = STAKE_LIVE
+
+    # Manual overrides → treat as clinched (i.e. "nothing to play for").
+    if manual_low_stakes:
+        for raw in manual_low_stakes:
+            t = normalize_country(map_fixture_name(str(raw)))
+            out[t] = STAKE_CLINCHED
+
+    return out
+
+
+def apply_stakes_adjustment(p_home, p_draw, p_away, home_stake, away_stake):
+    """Bend match probabilities by a small amount based on team stakes.
+
+    Returns renormalized (p_home, p_draw, p_away). Falls back to the inputs if
+    either stake is None or 'live'/unknown for both sides.
+    """
+    mh = _STAKE_MOTIVATION.get(home_stake, 1)
+    ma = _STAKE_MOTIVATION.get(away_stake, 1)
+    p_h, p_d, p_a = float(p_home), float(p_draw), float(p_away)
+
+    # Friendly: both teams have nothing to play for → shift mass into the draw.
+    if mh == 0 and ma == 0:
+        bump = min(STAKE_FRIENDLY_DRAW_BUMP, max(0.0, p_h + p_a - 0.05))
+        if bump > 0:
+            take_h = bump * (p_h / (p_h + p_a + 1e-12))
+            take_a = bump - take_h
+            p_h = max(0.0, p_h - take_h)
+            p_a = max(0.0, p_a - take_a)
+            p_d = p_d + bump
+    else:
+        diff = mh - ma
+        if diff != 0:
+            bias = max(min(STAKE_MOTIVATION_BIAS * diff, 0.10), -0.10)
+            if bias > 0:                       # favor home
+                take = min(bias, p_a * 0.60)
+                p_a -= take; p_h += take
+            else:                              # favor away
+                take = min(-bias, p_h * 0.60)
+                p_h -= take; p_a += take
+
+    tot = p_h + p_d + p_a
+    if tot <= 0:
+        return p_home, p_draw, p_away
+    return p_h / tot, p_d / tot, p_a / tot
+
+
+def adjust_scorer_for_stake(xg, stake):
+    """If a team is already clinched, reduce its predicted top-scorer xG (and
+    therefore the implied 'scores ≥1' probability). Other stakes pass through.
+    Returns (xg_adj, prob_adj).
+    """
+    if not xg or pd.isna(xg):
+        return xg, 0.0
+    factor = STAKE_SCORER_XG_FACTOR if stake == STAKE_CLINCHED else 1.0
+    xg_adj = float(xg) * factor
+    prob_adj = 1.0 - float(np.exp(-max(xg_adj, 0.0)))
+    return xg_adj, prob_adj
+
+
 # ── scoring previous predictions ───────────────────────────────────────────────
 SCORE_COLS = ("actual_home_score", "actual_away_score", "actual_outcome",
-              "correct", "match_logloss")
+              "correct", "match_logloss",
+              "home_scorer_hit", "away_scorer_hit")
 
 
-def score_previous_predictions(results, pred_dir="predictions"):
+def score_previous_predictions(results, goals=None, pred_dir="predictions"):
     """Score any previously-saved predictions whose match has now been played.
 
     Scans every predictions/<run>/predictions.csv, looks up each unscored row
@@ -470,17 +728,30 @@ def score_previous_predictions(results, pred_dir="predictions"):
         lookup[(row.date_str, row.home_team, row.away_team)] = (
             int(row.home_score), int(row.away_score))
 
+    # (date_str, team_canon) -> set of lowercased scorer names for that team in that match
+    scorers_lookup = {}
+    if goals is not None and len(goals) > 0:
+        g = goals.copy()
+        g["date_str"] = g["date"].dt.strftime("%Y-%m-%d")
+        for (d, t), grp in g.groupby(["date_str", "team"]):
+            scorers_lookup[(d, t)] = {str(s).strip().lower() for s in grp["scorer"]}
+
     def canon(name):
         return normalize_country(map_fixture_name(str(name)))
 
-    newly = []
-    lifetime = []
+    newly = []                # match-outcome predictions newly scored this run
+    newly_scorers = []        # scorer predictions newly scored this run
+    lifetime = []             # all match-outcome predictions ever scored
+    lifetime_scorers = []     # all scorer predictions ever scored
 
     for run in sorted(os.listdir(pred_dir)):
         csv_path = os.path.join(pred_dir, run, "predictions.csv")
         if not os.path.isfile(csv_path):
             continue
-        df = pd.read_csv(csv_path)
+        try:
+            df = pd.read_csv(csv_path)
+        except pd.errors.EmptyDataError:
+            continue
         for col in SCORE_COLS:
             if col not in df.columns:
                 df[col] = pd.NA
@@ -536,10 +807,59 @@ def score_previous_predictions(results, pred_dir="predictions"):
                     "correct": bool(df.at[i, "correct"]),
                     "logloss": float(df.at[i, "match_logloss"]),
                 })
+
+                # Grade saved top-scorer picks (one per team).
+                date_s = str(row["date"])
+                for side, team_col, pick_col, hit_col in (
+                    ("home", "home", "home_top_scorer", "home_scorer_hit"),
+                    ("away", "away", "away_top_scorer", "away_scorer_hit"),
+                ):
+                    if pick_col not in df.columns:
+                        continue
+                    pick_name = df.at[i, pick_col]
+                    if not isinstance(pick_name, str) or not pick_name.strip():
+                        continue
+                    team_canon = canon(row[team_col])
+                    actual_scorers = scorers_lookup.get((date_s, team_canon), None)
+                    if actual_scorers is None:
+                        # No scorers logged for this team in this match (e.g. clean sheet,
+                        # or upstream goalscorers.csv hasn't caught up yet) — only grade
+                        # as a miss if the team's goals-for in the match was 0, otherwise
+                        # skip and try again on a future run.
+                        team_goals = None
+                        if side == "home":
+                            v = df.at[i, "actual_home_score"]
+                        else:
+                            v = df.at[i, "actual_away_score"]
+                        if pd.notna(v):
+                            team_goals = int(v)
+                        if team_goals == 0:
+                            actual_scorers = set()
+                        else:
+                            continue
+                    hit_existing = df.at[i, hit_col] if hit_col in df.columns else pd.NA
+                    if pd.notna(hit_existing):
+                        lifetime_scorers.append({
+                            "hit": bool(hit_existing),
+                            "team": row[team_col],
+                            "pick": pick_name,
+                        })
+                        continue
+                    hit = str(pick_name).strip().lower() in actual_scorers
+                    df.at[i, hit_col] = bool(hit)
+                    changed = True
+                    newly_scorers.append({
+                        "date": date_s, "team": row[team_col], "pick": pick_name,
+                        "hit": bool(hit),
+                        "actual": sorted(actual_scorers) if actual_scorers else [],
+                    })
+                    lifetime_scorers.append({
+                        "hit": bool(hit), "team": row[team_col], "pick": pick_name,
+                    })
         if changed:
             df.to_csv(csv_path, index=False)
 
-    if not lifetime and not newly:
+    if not lifetime and not newly and not lifetime_scorers and not newly_scorers:
         return
 
     print("\n" + "=" * 60)
@@ -558,35 +878,66 @@ def score_previous_predictions(results, pred_dir="predictions"):
             print(f"    [{mark}] {s['date']}  {s['home']} vs {s['away']}  "
                   f"pick={s['pick']} ({s['confidence']*100:.1f}%)  "
                   f"actual={actual_disp} {s['score']}")
-    else:
+    elif not newly_scorers:
         print("  No new matches to score since last run.")
+
+    if newly_scorers:
+        n = len(newly_scorers)
+        n_hits = sum(1 for s in newly_scorers if s["hit"])
+        print(f"\n  Newly scored top-scorer picks: {n}")
+        print(f"    Hit rate : {n_hits}/{n} = {n_hits/n*100:.1f}%")
+        for s in newly_scorers:
+            mark = "OK " if s["hit"] else "MISS"
+            actual = ", ".join(s["actual"]) if s["actual"] else "no goal"
+            print(f"    [{mark}] {s['date']}  {s['team']:<22} pick={s['pick']}   "
+                  f"actual scorers: {actual}")
+
     if lifetime:
         ln = len(lifetime)
         lc = sum(1 for s in lifetime if s["correct"])
         lll = sum(s["logloss"] for s in lifetime) / ln
-        print(f"\n  Lifetime: {lc}/{ln} correct ({lc/ln*100:.1f}%)  log-loss {lll:.3f}")
+        print(f"\n  Lifetime match picks : {lc}/{ln} correct ({lc/ln*100:.1f}%)  log-loss {lll:.3f}")
+    if lifetime_scorers:
+        ls = len(lifetime_scorers)
+        lh = sum(1 for s in lifetime_scorers if s["hit"])
+        print(f"  Lifetime scorer picks: {lh}/{ls} hit ({lh/ls*100:.1f}%)")
     print("=" * 60)
 
 
 # ── main ────────────────────────────────────────────────────────────────────────
 def parse_args(argv):
     """Pull flags out of argv. Returns (positional_args, options_dict)."""
-    args, opts = [], {"refresh": False, "all": False}
-    for a in argv[1:]:
+    args, opts = [], {"refresh": False, "all": False,
+                      "no_stakes": False, "low_stakes": []}
+    it = iter(argv[1:])
+    for a in it:
         if a == "--refresh":
             opts["refresh"] = True
         elif a in ("--all", "-a"):
             opts["all"] = True
+        elif a == "--no-stakes":
+            opts["no_stakes"] = True
+        elif a == "--low-stakes":
+            try:
+                value = next(it)
+            except StopIteration:
+                continue
+            opts["low_stakes"].extend(
+                [t.strip() for t in value.split(",") if t.strip()])
+        elif a.startswith("--low-stakes="):
+            value = a.split("=", 1)[1]
+            opts["low_stakes"].extend(
+                [t.strip() for t in value.split(",") if t.strip()])
         else:
             args.append(a)
     return args, opts
 
 
-def predict_single(team_a, team_b, refresh=False):
+def predict_single(team_a, team_b, refresh=False, no_stakes=False, low_stakes=None):
     print("\nLoading data + building features ...")
     results = load_results(force_refresh=refresh)
     goals = load_goalscorers(force_refresh=refresh)
-    score_previous_predictions(results)
+    score_previous_predictions(results, goals)
     dataset, final_elo = build_dataset(results)
     valid_teams = set(results["home_team"]) | set(results["away_team"])
     long = per_team_long(results)
@@ -608,6 +959,18 @@ def predict_single(team_a, team_b, refresh=False):
 
     p_home, p_draw, p_away = predict_symmetric(
         model, long, final_elo, m["home"], m["away"], match_date, MATCH_NEUTRAL, MATCH_WEIGHT)
+
+    # Stakes adjustment (clinched / must-win / eliminated). Computed from the
+    # current group table as of the match date, plus any manual overrides.
+    fx_all = pd.read_csv(FIXTURES_PATH)
+    stakes = compute_group_stakes(results, fx_all, pd.Timestamp(match_date),
+                                  manual_low_stakes=low_stakes)
+    home_stake = stakes.get(m["home"], STAKE_LIVE)
+    away_stake = stakes.get(m["away"], STAKE_LIVE)
+    if not no_stakes:
+        p_home, p_draw, p_away = apply_stakes_adjustment(
+            p_home, p_draw, p_away, home_stake, away_stake)
+
     outcomes = [(m["home_disp"], p_home), ("Draw", p_draw), (m["away_disp"], p_away)]
     pick, conf = max(outcomes, key=lambda x: x[1])
     he, ae = final_elo.get(m["home"], ELO_BASE), final_elo.get(m["away"], ELO_BASE)
@@ -619,14 +982,24 @@ def predict_single(team_a, team_b, refresh=False):
 
     h_scorer, h_xg, h_prob = predict_top_scorer(goals, results, m["home"], match_date)
     a_scorer, a_xg, a_prob = predict_top_scorer(goals, results, m["away"], match_date)
+    if not no_stakes:
+        h_xg, h_prob = adjust_scorer_for_stake(h_xg, home_stake)
+        a_xg, a_prob = adjust_scorer_for_stake(a_xg, away_stake)
+
+    def _stake_tag(s):
+        return {STAKE_CLINCHED: "CLINCHED", STAKE_ELIMINATED: "ELIMINATED",
+                STAKE_MUST_WIN: "MUST-WIN"}.get(s, "")
 
     print("\n" + "=" * 60)
     print(f"  {m['home_disp']} vs {m['away_disp']}")
     print(f"  {match_date}  ·  {m['group']}  ·  {m['stadium']}")
     print("=" * 60)
-    print(f"  {m['home_disp']:<22} win   {p_home*100:>5.1f}%")
+    h_t, a_t = _stake_tag(home_stake), _stake_tag(away_stake)
+    h_suffix = f"  [{h_t}]" if h_t else ""
+    a_suffix = f"  [{a_t}]" if a_t else ""
+    print(f"  {m['home_disp']:<22} win   {p_home*100:>5.1f}%{h_suffix}")
     print(f"  {'Draw':<22}       {p_draw*100:>5.1f}%")
-    print(f"  {m['away_disp']:<22} win   {p_away*100:>5.1f}%")
+    print(f"  {m['away_disp']:<22} win   {p_away*100:>5.1f}%{a_suffix}")
     print("-" * 60)
     print(f"  PICK: {pick}  ({conf*100:.1f}%)   [{tag}]")
     print("-" * 60)
@@ -640,7 +1013,7 @@ def predict_single(team_a, team_b, refresh=False):
     print(f"  Chart saved -> {chart}\n")
 
 
-def predict_all(refresh=False):
+def predict_all(refresh=False, no_stakes=False, low_stakes=None):
     """Predict every upcoming fixture in fixtures.csv using the latest results data.
 
     Training is done once (cutoff = today), then reused for every fixture. Each
@@ -650,7 +1023,7 @@ def predict_all(refresh=False):
     print("\nLoading data + building features ...")
     results = load_results(force_refresh=refresh)
     goals = load_goalscorers(force_refresh=refresh)
-    score_previous_predictions(results)
+    score_previous_predictions(results, goals)
     dataset, final_elo = build_dataset(results)
     valid_teams = set(results["home_team"]) | set(results["away_team"])
     long = per_team_long(results)
@@ -665,6 +1038,33 @@ def predict_all(refresh=False):
     fx = pd.read_csv(FIXTURES_PATH)
     fx["_dt"] = pd.to_datetime(fx["date_dt"], errors="coerce")
 
+    # Build a lookup of upcoming (unplayed) matches from results.csv, keyed by
+    # date string (YYYY-MM-DD).  These are used to resolve placeholder fixture
+    # names (e.g. "Group E winners v Group C runners-up") once the actual teams
+    # are known.  We read the raw CSV (before dropna) because load_results()
+    # strips rows whose scores are still NaN.
+    _raw_results = fetch_results(force_refresh=refresh)
+    _raw_results["home_team"] = _raw_results["home_team"].map(normalize_country)
+    _raw_results["away_team"] = _raw_results["away_team"].map(normalize_country)
+    upcoming_by_date: dict = {}
+    for _, rr in _raw_results.iterrows():
+        if pd.isna(rr.get("home_score")):
+            d = str(rr["date"])[:10]
+            upcoming_by_date.setdefault(d, []).append(
+                (str(rr["home_team"]), str(rr["away_team"]))
+            )
+    used_upcoming: set = set()  # (date, home, away) already claimed
+
+    # Compute stakes once for the whole batch (snapshot as of today).
+    stakes = compute_group_stakes(results, fx, cutoff, manual_low_stakes=low_stakes)
+    n_clinched = sum(1 for v in stakes.values() if v == STAKE_CLINCHED)
+    n_must = sum(1 for v in stakes.values() if v == STAKE_MUST_WIN)
+    n_elim = sum(1 for v in stakes.values() if v == STAKE_ELIMINATED)
+    if stakes:
+        print(f"  Group-stage stakes detected: {n_clinched} clinched, "
+              f"{n_must} must-win, {n_elim} eliminated  "
+              f"(stakes adjustment {'OFF' if no_stakes else 'ON'})")
+
     run_label = str(today.date())
     run_dir = os.path.join("predictions", run_label)
     os.makedirs(run_dir, exist_ok=True)
@@ -678,8 +1078,24 @@ def predict_all(refresh=False):
         home = map_fixture_name(left)
         away = map_fixture_name(right)
         if home not in valid_teams or away not in valid_teams:
-            skipped_placeholder += 1
-            continue
+            # Placeholder fixture — try to resolve actual teams from results.csv
+            date_key = str(fr.get("date_dt", ""))[:10]
+            resolved = None
+            for h, a in upcoming_by_date.get(date_key, []):
+                key = (date_key, h, a)
+                if key not in used_upcoming:
+                    hn = normalize_country(map_fixture_name(h))
+                    an = normalize_country(map_fixture_name(a))
+                    if hn in valid_teams and an in valid_teams:
+                        resolved = (h, a)
+                        used_upcoming.add(key)
+                        break
+            if resolved is None:
+                skipped_placeholder += 1
+                continue
+            left, right = resolved
+            home = normalize_country(map_fixture_name(left))
+            away = normalize_country(map_fixture_name(right))
         if pd.notna(fr["_dt"]) and fr["_dt"] < today:
             skipped_played += 1
             continue
@@ -694,6 +1110,13 @@ def predict_all(refresh=False):
 
         p_home, p_draw, p_away = predict_symmetric(
             model, long, final_elo, home, away, match_date, MATCH_NEUTRAL, MATCH_WEIGHT)
+
+        home_stake = stakes.get(home, STAKE_LIVE)
+        away_stake = stakes.get(away, STAKE_LIVE)
+        if not no_stakes:
+            p_home, p_draw, p_away = apply_stakes_adjustment(
+                p_home, p_draw, p_away, home_stake, away_stake)
+
         outcomes = [(left, p_home), ("Draw", p_draw), (right, p_away)]
         pick, conf = max(outcomes, key=lambda x: x[1])
         he, ae = final_elo.get(home, ELO_BASE), final_elo.get(away, ELO_BASE)
@@ -702,6 +1125,9 @@ def predict_all(refresh=False):
 
         h_scorer, h_xg, h_prob = predict_top_scorer(goals, results, home, match_date)
         a_scorer, a_xg, a_prob = predict_top_scorer(goals, results, away, match_date)
+        if not no_stakes:
+            h_xg, h_prob = adjust_scorer_for_stake(h_xg, home_stake)
+            a_xg, a_prob = adjust_scorer_for_stake(a_xg, away_stake)
 
         rows.append({
             "match": m["match"], "date": match_date, "group": m["group"],
@@ -710,6 +1136,8 @@ def predict_all(refresh=False):
             "p_away": round(p_away, 4),
             "pick": pick, "confidence": round(conf, 4),
             "tag": tag,
+            "home_stake": home_stake,
+            "away_stake": away_stake,
             "home_top_scorer": h_scorer or "",
             "home_scorer_xg": h_xg,
             "home_scorer_prob": h_prob,
@@ -726,10 +1154,15 @@ def predict_all(refresh=False):
     print(f"\nPredicted {len(df)} upcoming matches  "
           f"(skipped {skipped_played} already played, {skipped_placeholder} placeholder fixtures).")
     if not df.empty:
+        _short = {STAKE_CLINCHED: "CL", STAKE_ELIMINATED: "EL", STAKE_MUST_WIN: "MW"}
         print("\n  " + f"{'Date':<11} {'Match':<42} {'Home':>6} {'Draw':>6} {'Away':>6}  Pick")
         print("  " + "-" * 92)
         for _, r in df.iterrows():
             mp = f"{r['home']} vs {r['away']}"
+            hs = _short.get(r.get("home_stake"), "")
+            as_ = _short.get(r.get("away_stake"), "")
+            if hs or as_:
+                mp = f"{r['home']}[{hs or '-'}] vs {r['away']}[{as_ or '-'}]"
             if len(mp) > 41:
                 mp = mp[:38] + "..."
             print(f"  {str(r['date']):<11} {mp:<42} "
@@ -745,6 +1178,10 @@ def predict_all(refresh=False):
             h_disp = f"{r['home_top_scorer']} ({r['home_scorer_prob']*100:.0f}%)" if r['home_top_scorer'] else "-"
             a_disp = f"{r['away_top_scorer']} ({r['away_scorer_prob']*100:.0f}%)" if r['away_top_scorer'] else "-"
             print(f"  {str(r['date']):<11} {mp:<36}  {r['home']:<14}→ {h_disp:<32}  {r['away']:<14}→ {a_disp}")
+
+        # Legend if any stake tags were shown
+        if any(r.get("home_stake") in _short or r.get("away_stake") in _short for _, r in df.iterrows()):
+            print("\n  Stake legend: [CL] clinched · [MW] must-win · [EL] eliminated · [-] live")
     print(f"\nSummary CSV -> {csv_path}")
     print(f"Charts      -> {run_dir}\n")
 
@@ -754,18 +1191,21 @@ def main():
 
     # Two team names → single-match mode (preserves the original behavior).
     if len(args) >= 2:
-        predict_single(args[0], args[1], refresh=opts["refresh"])
+        predict_single(args[0], args[1], refresh=opts["refresh"],
+                       no_stakes=opts["no_stakes"], low_stakes=opts["low_stakes"])
         return
 
     # No team args, or --all → predict every upcoming fixture.
     if len(args) == 0 or opts["all"]:
-        predict_all(refresh=opts["refresh"])
+        predict_all(refresh=opts["refresh"],
+                    no_stakes=opts["no_stakes"], low_stakes=opts["low_stakes"])
         return
 
     # Only one team name supplied — fall back to interactive prompt.
     print("Enter the two teams to predict (e.g. Saudi Arabia / Uruguay).")
     b = input("  Team 2: ").strip()
-    predict_single(args[0], b, refresh=opts["refresh"])
+    predict_single(args[0], b, refresh=opts["refresh"],
+                   no_stakes=opts["no_stakes"], low_stakes=opts["low_stakes"])
 
 
 if __name__ == "__main__":
